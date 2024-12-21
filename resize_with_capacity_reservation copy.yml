@@ -1,0 +1,430 @@
+description: 'Create EC2 Capacity Reservation and resize instance to match'
+schemaVersion: '0.3'
+parameters:
+  InstanceId:
+    type: String
+    description: 'ID of the EC2 instance to resize'
+  TargetInstanceType:
+    type: String
+    description: 'Target instance type for resizing'
+    allowedPattern: '^[a-z0-9]+\.[a-z0-9]+$'
+  AvailabilityZone:
+    type: String
+    description: 'AZ where capacity reservation should be created'
+  Platform:
+    type: String
+    description: 'Platform for the capacity reservation'
+    allowedValues:
+      - Linux/UNIX
+      - Red Hat Enterprise Linux
+      - SUSE Linux
+      - Windows
+      - Windows with SQL Server
+  Tenancy:
+    type: String
+    description: 'Tenancy for the capacity reservation'
+    default: default
+    allowedValues:
+      - default
+      - dedicated
+  MaxRetryDurationMinutes:
+    type: String
+    description: 'Maximum duration in minutes to keep retrying capacity reservation'
+    default: '60'
+  InitialRetryIntervalSeconds:
+    type: String
+    description: 'Initial interval in seconds between retry attempts'
+    default: '30'
+  MaxRetryIntervalSeconds:
+    type: String
+    description: 'Maximum interval in seconds between retry attempts'
+    default: '300'
+  BackoffMultiplier:
+    type: String
+    description: 'Multiplier for exponential backoff between retries'
+    default: '2'
+  AutomationAssumeRole:
+    type: String
+    description: '(Optional) ARN of the IAM role that allows Automation to perform the actions on your behalf'
+
+mainSteps:
+  - name: getInstanceDetails
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ InstanceId }}'
+    outputs:
+      - Name: currentInstanceType
+        Selector: '$.Reservations[0].Instances[0].InstanceType'
+        Type: String
+      - Name: currentAZ
+        Selector: '$.Reservations[0].Instances[0].Placement.AvailabilityZone'
+        Type: String
+    description: 'Get current instance details'
+
+  - name: checkCapacityAvailability
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ec2
+      Api: DescribeAvailableCapacity
+      InstanceType: '{{ TargetInstanceType }}'
+      AvailabilityZone: '{{ AvailabilityZone }}'
+    onFailure: 'step:handleCapacityCheckFailure'
+    description: 'Check if capacity is available before attempting reservation'
+
+  - name: attemptCapacityReservation
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.8
+      Handler: create_reservation
+      Script: |
+        def create_reservation(events, context):
+            import boto3
+            import time
+            from datetime import datetime, timedelta
+            
+            ec2 = boto3.client('ec2')
+            
+            # Convert parameters to appropriate types
+            max_duration = int(events['MaxRetryDurationMinutes']) * 60  # convert to seconds
+            initial_interval = int(events['InitialRetryIntervalSeconds'])
+            max_interval = int(events['MaxRetryIntervalSeconds'])
+            backoff = float(events['BackoffMultiplier'])
+            
+            start_time = datetime.now()
+            current_interval = initial_interval
+            attempt = 1
+            
+            while (datetime.now() - start_time).total_seconds() < max_duration:
+                try:
+                    response = ec2.create_capacity_reservation(
+                        InstanceType=events['InstanceType'],
+                        InstancePlatform=events['Platform'],
+                        AvailabilityZone=events['AvailabilityZone'],
+                        InstanceCount=1,
+                        InstanceMatchCriteria='targeted',
+                        Tenancy=events['Tenancy'],
+                        EndDateType='unlimited'
+                    )
+                    return {
+                        'capacityReservationId': response['CapacityReservation']['CapacityReservationId'],
+                        'success': True,
+                        'attempts': attempt,
+                        'totalDuration': int((datetime.now() - start_time).total_seconds())
+                    }
+                except ec2.exceptions.InsufficientCapacityException:
+                    # Calculate time remaining
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    remaining = max_duration - elapsed
+                    
+                    if remaining < current_interval:
+                        return {
+                            'success': False,
+                            'error': f'InsufficientCapacity after {attempt} attempts over {int(elapsed)} seconds',
+                            'attempts': attempt,
+                            'totalDuration': int(elapsed)
+                        }
+                    
+                    # Sleep with exponential backoff
+                    time.sleep(current_interval)
+                    
+                    # Update interval for next attempt
+                    current_interval = min(current_interval * backoff, max_interval)
+                    attempt += 1
+                    
+                except Exception as e:
+                    return {
+                        'success': False,
+                        'error': f'Error on attempt {attempt}: {str(e)}',
+                        'attempts': attempt,
+                        'totalDuration': int((datetime.now() - start_time).total_seconds())
+                    }
+            
+            return {
+                'success': False,
+                'error': f'Exceeded maximum retry duration ({max_duration} seconds) after {attempt} attempts',
+                'attempts': attempt,
+                'totalDuration': max_duration
+            }
+            
+      InputPayload:
+        InstanceType: '{{ TargetInstanceType }}'
+        Platform: '{{ Platform }}'
+        AvailabilityZone: '{{ AvailabilityZone }}'
+        Tenancy: '{{ Tenancy }}'
+        MaxRetryDurationMinutes: '{{ MaxRetryDurationMinutes }}'
+        InitialRetryIntervalSeconds: '{{ InitialRetryIntervalSeconds }}'
+        MaxRetryIntervalSeconds: '{{ MaxRetryIntervalSeconds }}'
+        BackoffMultiplier: '{{ BackoffMultiplier }}'
+    outputs:
+      - Name: capacityReservationId
+        Selector: $.Payload.capacityReservationId
+        Type: String
+      - Name: success
+        Selector: $.Payload.success
+        Type: Boolean
+      - Name: error
+        Selector: $.Payload.error
+        Type: String
+      - Name: attempts
+        Selector: $.Payload.attempts
+        Type: Integer
+      - Name: totalDuration
+        Selector: $.Payload.totalDuration
+        Type: Integer
+    onFailure: 'step:handleCapacityReservationFailure'
+    description: 'Create capacity reservation with retries'
+
+  - name: handleCapacityCheckFailure
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ec2
+      Api: DescribeInstanceTypeOfferings
+      LocationType: availability-zone
+      Filters:
+        - Name: location
+          Values: ['{{ AvailabilityZone }}']
+    outputs:
+      - Name: availableTypes
+        Selector: '$.InstanceTypeOfferings[*].InstanceType'
+        Type: StringList
+    description: 'Get available instance types in AZ'
+    isEnd: false
+
+  - name: handleCapacityReservationFailure
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.8
+      Handler: suggest_alternatives
+      Script: |
+        def suggest_alternatives(events, context):
+            import boto3
+            
+            ec2 = boto3.client('ec2')
+            response = ec2.describe_instance_types(
+                InstanceTypes=[events['TargetType']]
+            )
+            
+            if response['InstanceTypes']:
+                instance = response['InstanceTypes'][0]
+                vcpus = instance['VCpuInfo']['DefaultVCpus']
+                memory = instance['MemoryInfo']['SizeInMiB']
+                
+                # Find similar types
+                similar = ec2.describe_instance_types(
+                    Filters=[
+                        {'Name': 'vcpu-info.default-vcpus', 'Values': [str(vcpus)]},
+                        {'Name': 'memory-info.size-in-mib', 'Values': [str(memory)]}
+                    ]
+                )
+                
+                return {
+                    'alternativeTypes': [t['InstanceType'] for t in similar['InstanceTypes']],
+                    'message': f"Capacity not available for {events['TargetType']}. Consider these alternatives with similar specs (vCPUs: {vcpus}, Memory: {memory}MB)"
+                }
+            return {
+                'alternativeTypes': [],
+                'message': f"Failed to get alternatives for {events['TargetType']}"
+            }
+      InputPayload:
+        TargetType: '{{ TargetInstanceType }}'
+    outputs:
+      - Name: alternativeTypes
+        Selector: $.Payload.alternativeTypes
+        Type: StringList
+      - Name: message
+        Selector: $.Payload.message
+        Type: String
+    description: 'Find alternative instance types on failure'
+    isEnd: true
+
+  - name: stopInstance
+    action: 'aws:changeInstanceState'
+    inputs:
+      InstanceIds:
+        - '{{ InstanceId }}'
+      DesiredState: stopped
+    onFailure: 'step:cleanupOnFailure'
+    description: 'Stop the instance before resizing'
+
+  - name: waitForInstanceStop
+    action: 'aws:waitForAwsResourceProperty'
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ InstanceId }}'
+      PropertySelector: '$.Reservations[0].Instances[0].State.Name'
+      DesiredValues:
+        - stopped
+    description: 'Wait for instance to reach stopped state'
+    onFailure: 'step:cleanupOnFailure'
+
+  - name: modifyInstance
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ec2
+      Api: ModifyInstance
+      InstanceId: '{{ InstanceId }}'
+      InstanceType: '{{ TargetInstanceType }}'
+      CapacityReservationSpecification:
+        CapacityReservationTarget:
+          CapacityReservationId: '{{ attemptCapacityReservation.capacityReservationId }}'
+    onFailure: 'step:handleModifyFailure'
+    description: 'Modify instance type and associate with capacity reservation'
+
+  - name: startInstance
+    action: 'aws:changeInstanceState'
+    inputs:
+      InstanceIds:
+        - '{{ InstanceId }}'
+      DesiredState: running
+    onFailure: 'step:handleStartFailure'
+    description: 'Start the resized instance'
+
+  - name: verifyInstanceType
+    action: 'aws:assertAwsResourceProperty'
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ InstanceId }}'
+      PropertySelector: '$.Reservations[0].Instances[0].InstanceType'
+      DesiredValues:
+        - '{{ TargetInstanceType }}'
+    description: 'Verify instance has been resized to target type'
+    onFailure: 'step:handleVerificationFailure'
+
+  - name: cleanupOnFailure
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ec2
+      Api: CancelCapacityReservation
+      CapacityReservationId: '{{ attemptCapacityReservation.capacityReservationId }}'
+    description: 'Clean up capacity reservation on failure'
+    isEnd: true
+
+  - name: handleModifyFailure
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.8
+      Handler: handle_modify_failure
+      Script: |
+        def handle_modify_failure(events, context):
+            import boto3
+            ec2 = boto3.client('ec2')
+            
+            # Cancel the capacity reservation
+            ec2.cancel_capacity_reservation(
+                CapacityReservationId=events['CapacityReservationId']
+            )
+            
+            return {
+                'error': 'Failed to modify instance. Capacity reservation has been cancelled.'
+            }
+      InputPayload:
+        CapacityReservationId: '{{ attemptCapacityReservation.capacityReservationId }}'
+    description: 'Handle instance modification failure'
+    isEnd: true
+
+  - name: handleStartFailure
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.8
+      Handler: handle_start_failure
+      Script: |
+        def handle_start_failure(events, context):
+            import boto3
+            ec2 = boto3.client('ec2')
+            
+            # Revert instance type
+            try:
+                ec2.modify_instance(
+                    InstanceId=events['InstanceId'],
+                    InstanceType=events['OriginalType']
+                )
+            except Exception:
+                pass
+            
+            # Cancel capacity reservation
+            try:
+                ec2.cancel_capacity_reservation(
+                    CapacityReservationId=events['CapacityReservationId']
+                )
+            except Exception:
+                pass
+            
+            return {
+                'error': 'Failed to start instance. Reverted to original type and cancelled reservation.'
+            }
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+        OriginalType: '{{ getInstanceDetails.currentInstanceType }}'
+        CapacityReservationId: '{{ attemptCapacityReservation.capacityReservationId }}'
+    description: 'Handle instance start failure'
+    isEnd: true
+
+  - name: handleVerificationFailure
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.8
+      Handler: handle_verify_failure
+      Script: |
+        def handle_verify_failure(events, context):
+            import boto3
+            ec2 = boto3.client('ec2')
+            
+            # Attempt to revert instance type
+            try:
+                ec2.modify_instance(
+                    InstanceId=events['InstanceId'],
+                    InstanceType=events['OriginalType']
+                )
+            except Exception:
+                pass
+            
+            # Cancel capacity reservation
+            try:
+                ec2.cancel_capacity_reservation(
+                    CapacityReservationId=events['CapacityReservationId']
+                )
+            except Exception:
+                pass
+            
+            return {
+                'error': 'Instance type verification failed. Attempted to revert changes.'
+            }
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+        OriginalType: '{{ getInstanceDetails.currentInstanceType }}'
+        CapacityReservationId: '{{ attemptCapacityReservation.capacityReservationId }}'
+    description: 'Handle verification failure'
+    isEnd: true
+
+outputs:
+  - capacityReservationId
+    description: 'ID of the created capacity reservation'
+    type: String
+    value: '{{ attemptCapacityReservation.capacityReservationId }}'
+  - finalInstanceType
+    description: 'Final instance type after resize'
+    type: String
+    value: '{{ TargetInstanceType }}'
+  - status
+    description: 'Final status of the automation'
+    type: String
+    value: '{{ attemptCapacityReservation.success }}'
+  - errorMessage
+    description: 'Error message if automation failed'
+    type: String
+    value: '{{ attemptCapacityReservation.error }}'
+  - attempts
+    description: 'Number of capacity reservation attempts made'
+    type: Integer
+    value: '{{ attemptCapacityReservation.attempts }}'
+  - totalDuration
+    description: 'Total duration in seconds spent attempting capacity reservation'
+    type: Integer
+    value: '{{ attemptCapacityReservation.totalDuration }}'

@@ -1,0 +1,10 @@
+{
+  "nuxt.isNuxtApp": false,
+  "cSpell.words": [
+    "botocore",
+    "stubber",
+    "timedelta",
+    "vcpu",
+    "vcpus"
+  ]
+}
